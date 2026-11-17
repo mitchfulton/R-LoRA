@@ -1,9 +1,4 @@
-accelerate
-appdirs
-bitsandbytes
-black
-black[jupyter]
 datasets
 fire
-git+https://github.com/huggingface/transformers.git
-gradio
+peft
+transformers

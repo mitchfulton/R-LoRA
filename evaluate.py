@@ -9,10 +9,11 @@ import fire
 
 import torch
 
-sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
+#sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
 from peft import PeftModel
 from tqdm import tqdm
 from transformers import GenerationConfig, LlamaForCausalLM, LlamaTokenizer, AutoModelForCausalLM, AutoTokenizer
+from recursive_peft import load_recursive_peft_model
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -27,10 +28,10 @@ except:  # noqa: E722
 
 
 def main(
-        load_8bit: bool = False,
+        dataset: str = "",
         base_model: str = "",
-        lora_weights: str = "tloen/alpaca-lora-7b",
-        share_gradio: bool = False,
+        lora_weights: str = "/data/saved_models/lora_wts/",
+        
 ):
     args = parse_args()
 
@@ -47,10 +48,11 @@ def main(
         prompt = generate_prompt(instruction, input)
         inputs = tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
         generation_config = GenerationConfig(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
+            #temperature=temperature,
+            #top_p=top_p,
+            #top_k=top_k,
             num_beams=num_beams,
             **kwargs,
         )
@@ -58,10 +60,12 @@ def main(
             generation_output = model.generate(
                 input_ids=input_ids,
                 generation_config=generation_config,
+                attention_mask=attention_mask,
+                pad_token_id=tokenizer.eos_token_id,
                 return_dict_in_generate=True,
                 output_scores=True,
                 max_new_tokens=max_new_tokens,
-                use_cache=False,
+                #use_cache=False,
             )
         s = generation_output.sequences[0]
         output = tokenizer.decode(s)
@@ -84,7 +88,7 @@ def main(
         print("Response:", evaluate(instruction))
         print()
     """
-    save_file = f'experiment/{args.model}-{args.adapter}-{args.dataset}.json'
+    save_file = f'experiment/{args.base_model}-{args.dataset}.json'
     create_dir('experiment/')
 
     dataset = load_data(args)
@@ -105,6 +109,20 @@ def main(
             if label == predict:
                 correct += 1
                 flag = True
+        elif args.dataset.lower() in ['math']:
+            predict = extract_math_answer(outputs, args.base_model=='google/gemma-7b')
+            try:
+                predict = float(predict)
+                label = float(label)
+                if abs(label - predict) <= miss:
+                    correct += 1
+                    flag = True
+            except ValueError:
+                label = "".join(label.split())
+                #print(predict,label, label==predict)
+                if label == predict:
+                    correct += 1
+                    flag = True
         else:
             if isinstance(label, str):
                 label = float(label)
@@ -112,20 +130,20 @@ def main(
             if abs(label - predict) <= miss:
                 correct += 1
                 flag = True
-        new_data = copy.deepcopy(data)
-        new_data['output_pred'] = outputs
-        new_data['pred'] = predict
-        new_data['flag'] = flag
-        output_data.append(new_data)
-        print(' ')
-        print('---------------')
-        print(outputs)
-        print('prediction:', predict)
-        print('label:', label)
-        print('---------------')
+        #new_data = copy.deepcopy(data)
+        #new_data['output_pred'] = outputs
+        #new_data['pred'] = predict
+        #new_data['flag'] = flag
+        #output_data.append(new_data)
+        #print(' ')
+        #print('---------------')
+        #print(outputs)
+        #print('prediction:', predict)
+        #print('label:', label)
+        #print('---------------')
         print(f'\rtest:{idx + 1}/{total} | accuracy {correct}  {correct / (idx + 1)}')
-        with open(save_file, 'w+') as f:
-            json.dump(output_data, f, indent=4)
+        #with open(save_file, 'w+') as f:
+        #    json.dump(output_data, f, indent=4)
         pbar.update(1)
     pbar.close()
     print('\n')
@@ -178,14 +196,10 @@ def load_data(args) -> list:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', choices=['AddSub', 'MultiArith', 'SingleEq', 'gsm8k', 'AQuA', 'SVAMP'],
-                        required=True)
-    parser.add_argument('--model', choices=['LLaMA-7B', 'BLOOM-7B', 'GPT-j-6B'], required=True)
-    parser.add_argument('--adapter', choices=['LoRA', 'AdapterP', 'AdapterH', 'Parallel', 'Prefix'],
+    parser.add_argument('--dataset', choices=['AddSub', 'MultiArith', 'SingleEq', 'gsm8k', 'AQuA', 'SVAMP', 'MATH'],
                         required=True)
     parser.add_argument('--base_model', required=True)
     parser.add_argument('--lora_weights', required=True)
-    parser.add_argument('--load_8bit', action='store_true', default=False)
 
     return parser.parse_args()
 
@@ -201,41 +215,51 @@ def load_model(args) -> tuple:
     """
     base_model = args.base_model
     if not base_model:
-        raise ValueError(f'can not find base model name by the value: {args.model}')
+        raise ValueError(f'can not find base model name by the value: {args.base_model}')
     lora_weights = args.lora_weights
     if not lora_weights:
         raise ValueError(f'can not find lora weight, the value is: {lora_weights}')
 
-    load_8bit = args.load_8bit
-    if args.model == 'LLaMA-7B':
+    if args.base_model == 'LLaMA-7B':
         tokenizer = LlamaTokenizer.from_pretrained(base_model)
     else:
         tokenizer = AutoTokenizer.from_pretrained(base_model)
     if device == "cuda":
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            load_in_8bit=load_8bit,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="auto",
             trust_remote_code=True,
         ) # fix zwq
+        
+        model = load_recursive_peft_model(
+            model,
+            lora_weights,
+            #device_map={"":0}
+        )
+        """
         model = PeftModel.from_pretrained(
             model,
             lora_weights,
             torch_dtype=torch.float16,
             device_map={"":0}
         )
+        """
+        model = model.merge_and_unload()
+        
+        model.eval()
+        
     elif device == "mps":
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
             device_map={"": device},
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
         model = PeftModel.from_pretrained(
             model,
             lora_weights,
             device_map={"": device},
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
@@ -252,8 +276,7 @@ def load_model(args) -> tuple:
         model.config.bos_token_id = 1
         model.config.eos_token_id = 2
 
-        if not load_8bit:
-            model.half()  # seems to fix bugs for some users.
+        model.half()  # seems to fix bugs for some users.
 
         model.eval()
         if torch.__version__ >= "2" and sys.platform != "win32":
@@ -271,7 +294,7 @@ def load_instruction(args) -> str:
 
 def extract_answer_number(args, sentence: str) -> float:
     dataset = args.dataset.lower()
-    if dataset in ["multiarith", "addsub", "singleeq", "gsm8k", "svamp"]:
+    if dataset in ["multiarith", "addsub", "singleeq", "gsm8k", "svamp", "math"]:
         sentence = sentence.replace(',', '')
         pred = [s for s in re.findall(r'-?\d+\.?\d*', sentence)]
         if not pred:
@@ -286,6 +309,19 @@ def extract_answer_number(args, sentence: str) -> float:
             pred_answer = float('inf')
     return pred_answer
 
+def extract_math_answer(sentence: str, is_gemma: bool=False) -> str:
+    idx = sentence.rfind("The answer is: ") + 15
+    idx_end = sentence.rfind("</s>")
+    if is_gemma:
+        idx_end = sentence.rfind("<eos>")
+    if idx==None or idx_end==None:
+        return float('inf')
+    else:
+        try:
+            pred_answer = float(sentence[idx:idx_end])
+            return pred_answer
+        except ValueError as e:
+            return "".join(sentence[idx:idx_end].split())
 
 def extract_answer_letter(args, sentence: str) -> str:
     sentence_ = sentence.strip()

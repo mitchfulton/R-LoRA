@@ -13,17 +13,21 @@ Unused imports:
 import torch.nn as nn
 import bitsandbytes as bnb
 """
-sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
+#sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
 from peft import (  # noqa: E402
     LoraConfig,
-    BottleneckConfig,
-    PrefixTuningConfig,
+    ShiraConfig,
+    OFTConfig,
+    #BottleneckConfig,
+    #PrefixTuningConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
     set_peft_model_state_dict,
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, AutoModel  # noqa: F402
+
+from recursive_peft import create_recursive_peft_model
 
 
 def train(
@@ -34,20 +38,25 @@ def train(
         adapter_name: str = "lora",
         load_8bit : bool = False,
         # training hyperparams
-        batch_size: int = 128,
+        batch_size: int = 16,
         micro_batch_size: int = 4,
         num_epochs: int = 3,
         learning_rate: float = 3e-4,
         cutoff_len: int = 256,
-        val_set_size: int = 2000,
+        val_set_size: int = 120,
         use_gradient_checkpointing: bool = False,
-        eval_step: int = 200,
-        save_step: int = 200,
+        eval_step: int = 80,
+        save_step: int = 80,
         # lora hyperparams
-        lora_r: int = 8,
-        lora_alpha: int = 16,
+        lora_r: int = 32,
+        lora_alpha: int = 8,
         lora_dropout: float = 0.05,
         lora_target_modules: List[str] = None,
+        use_recursive_peft: bool = False,
+        recursion_depth: int = 7,
+        use_dora: bool = False,
+        use_shira: bool = False,
+        use_oft: bool = False,
         # bottleneck adapter hyperparams
         bottleneck_size: int = 256,
         non_linearity: str = "tanh",
@@ -84,6 +93,11 @@ def train(
         f"lora_alpha: {lora_alpha}\n"
         f"lora_dropout: {lora_dropout}\n"
         f"lora_target_modules: {lora_target_modules}\n"
+        f"use_recursive_peft: {use_recursive_peft}\n"
+        f"recursion_depth: {recursion_depth}\n"
+        f"use_dora: {use_dora}\n"
+        f"use_shira: {use_shira}\n"
+        f"use_oft: {use_oft}\n"
         f"bottleneck_size: {bottleneck_size}\n"
         f"non_linearity: {non_linearity}\n"
         f"adapter_dropout: {adapter_dropout}\n"
@@ -135,17 +149,13 @@ def train(
     else:
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            load_in_8bit=False,
+            #load_in_8bit=False,
             torch_dtype=torch.float16,
             device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
             trust_remote_code=True,
         )
 
-    if model.config.model_type == "llama":
-        # Due to the name of transformers' LlamaTokenizer, we have to do this
-        tokenizer = LlamaTokenizer.from_pretrained(base_model)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
 
     tokenizer.pad_token_id = (
         0  # unk. we want this to be different from the eos token
@@ -193,16 +203,34 @@ def train(
                                                                     ]  # could be sped up, probably
         return tokenized_full_prompt
 
-    model = prepare_model_for_int8_training(model, use_gradient_checkpointing=use_gradient_checkpointing)
+    #model = prepare_model_for_int8_training(model, use_gradient_checkpointing=use_gradient_checkpointing)
     if adapter_name == "lora":
-        config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
+        if use_shira:
+            config = ShiraConfig(
+                r=lora_r,
+                target_modules=target_modules,
+                task_type="CAUSAL_LM",
+            )
+        elif use_oft:
+            config = OFTConfig(
+                r=0,
+                oft_block_size=lora_r,
+                module_dropout=lora_dropout,
+                task_type="CAUSAL_LM",
+                target_modules=target_modules
+            )
+        else:
+            config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+                use_dora=use_dora,
+                #init_lora_weights="orthogonal",
+            )
+        
     elif adapter_name == "bottleneck":
         config = BottleneckConfig(
             bottleneck_size=bottleneck_size,
@@ -220,7 +248,21 @@ def train(
             num_virtual_tokens=num_virtual_tokens,
             task_type="CAUSAL_LM",
         )
-    model = get_peft_model(model, config)
+
+
+
+    if use_recursive_peft:
+        model = create_recursive_peft_model(
+            model, 
+            config, 
+            recursion_depth=recursion_depth,
+        )
+        
+    else:
+        model = get_peft_model(model, config)
+
+
+    
     if adapter_name == "prefix-tuning":
         model.to('cuda')
 
@@ -270,6 +312,14 @@ def train(
         model.is_parallelizable = True
         model.model_parallel = True
 
+
+    
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.float()
+        
+
+    
     trainer = transformers.Trainer(
         model=model,
         train_dataset=train_data,
@@ -283,22 +333,23 @@ def train(
             fp16=True,
             logging_steps=10,
             optim="adamw_torch",
-            evaluation_strategy="steps" if val_set_size > 0 else "no",
-            save_strategy="steps",
-            eval_steps=eval_step if val_set_size > 0 else None,
-            save_steps=save_step,
+            eval_strategy="no",
+            save_strategy="no",
+            #eval_steps=eval_step if val_set_size > 0 else None,
+            #save_steps=save_step,
             output_dir=output_dir,
             save_total_limit=3,
             load_best_model_at_end=True if val_set_size > 0 else False,
             ddp_find_unused_parameters=False if ddp else None,
-            group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
+            #group_by_length=group_by_length,
+            report_to="wandb" if use_wandb else [],
             run_name=wandb_run_name if use_wandb else None,
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
     )
+    """
     model.config.use_cache = False
 
     old_state_dict = model.state_dict
@@ -311,13 +362,14 @@ def train(
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
 
+    """
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     model.save_pretrained(output_dir)
 
-    print(
-        "\n If there's a warning about missing keys above, please disregard :)"
-    )
+    #print(
+    #    "\n If there's a warning about missing keys above, please disregard :)"
+    #)
 
 
 def generate_prompt(data_point):
